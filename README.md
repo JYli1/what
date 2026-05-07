@@ -1,6 +1,35 @@
 # what
 
-终端命令智能分析工具。执行任意命令后输入 `what`，自动将上一条命令和输出发给 LLM 分析。
+> 让终端报错自己解释自己。
+
+`what` 是一个终端命令智能分析工具：执行任意命令后输入 `what`，它会自动读取上一条命令、退出码和终端输出，交给 LLM 分析，然后用中文告诉你发生了什么、为什么失败、下一步该怎么做。
+
+它适合这些场景：
+
+- 开发调试：快速定位构建失败、依赖缺失、运行时报错。
+- Linux / 运维排障：分析服务状态、权限、网络、资源和日志线索。
+- CTF / 授权渗透测试：总结扫描结果、提取漏洞线索、给出下一步枚举方向。
+- 长输出快速总结：不用在几百行日志里手动翻关键错误。
+
+已经实现：
+
+- 自动捕获上一条命令、退出码和输出。
+- 默认 Markdown 渲染，报错分析更容易读。
+- 兼容常见 LLM API，可接 DeepSeek、Ollama 等服务。
+- 内置 `default` / `pentest` / `dev` / `ops` / `custom` 工作方向。
+- 支持 `--smart` 本地智能缩减长输出，节省 token。
+- 支持 `--show` 只查看捕获内容，不调用 API。
+- 完整日志与 LLM 对话原文记录，方便排查和复盘。
+- 支持 zsh / bash hook，安装后自然融入终端工作流。
+
+```bash
+$ npm run build
+...
+error: Cannot find module 'xxx'
+
+$ what
+# 直接告诉你错误原因、修复命令和下一步检查点
+```
 
 ## 安装
 
@@ -92,7 +121,7 @@ what --show
 
 ## 配置
 
-`~/.what/config`，兼容所有 OpenAI 格式 API：
+`~/.what/config`，兼容常见 LLM API：
 
 ```ini
 api_base = https://api.openai.com/v1    # 也支持 DeepSeek、Ollama
@@ -216,4 +245,4 @@ cat ~/.what/what.log       # 查看完整日志
 ```
 
 - `what-hook.sh`：用 `script` 录制终端 + zsh `preexec`/`precmd` 或 bash `DEBUG trap` 捕获
-- `what`：Python 主程序，调用 OpenAI 兼容 API
+- `what`：Python 主程序，调用 LLM 兼容 API

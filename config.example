@@ -1,0 +1,38 @@
+# what 配置文件
+# 支持所有 OpenAI 兼容 API（OpenAI、DeepSeek、Ollama、vLLM 等）
+
+# ── API 设置 ──
+
+# API 地址（必填）
+# OpenAI:    https://api.openai.com/v1
+# DeepSeek:  https://api.deepseek.com/v1
+# Ollama:    http://localhost:11434/v1
+api_base = https://api.openai.com/v1
+
+# API 密钥（必填，Ollama 本地可填任意值）
+api_key = sk-your-api-key-here
+
+# 模型名称
+# OpenAI:    gpt-4o-mini / gpt-4o
+# DeepSeek:  deepseek-chat
+# Ollama:    qwen2.5:7b / llama3:8b
+model = gpt-4o-mini
+
+# ── 输出设置 ──
+
+# 最大捕获输出字符数（超长输出会保留头尾并截断中间）
+max_output_chars = 20000
+
+# ── AI 总结方向 ──
+
+# 工作方向：default / pentest / dev / ops / custom
+# default: 通用命令分析
+# pentest: 授权渗透测试/靶场，关注信息收集、漏洞线索、下一步枚举
+# dev: 开发调试，关注报错原因、依赖、修复命令
+# ops: 运维排障，关注服务、网络、权限、资源
+# custom: 使用下方自定义方向
+profile = default
+
+# 自定义分析偏好，会追加到 prompt 中
+# 例：我主要在打 Web 靶场，请优先从信息收集、漏洞利用思路和下一步命令角度总结。
+custom_instruction =

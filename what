@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""
+what - 终端命令智能分析工具
+在终端中执行任意命令后，输入 what 即可让 LLM 帮你分析命令执行结果。
+"""
+
+import os
+import sys
+import json
+import re
+import argparse
+from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+# ── 路径常量 ──
+CONFIG_DIR = os.path.expanduser("~/.what")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+SESSION_LOG = os.path.join(CONFIG_DIR, "session.log")
+LAST_CMD_FILE = os.path.join(CONFIG_DIR, "last_cmd")
+LAST_EXIT_FILE = os.path.join(CONFIG_DIR, "last_exit")
+OUTPUT_START_FILE = os.path.join(CONFIG_DIR, "output_start")
+OUTPUT_END_FILE = os.path.join(CONFIG_DIR, "output_end")
+LOG_FILE = os.path.join(CONFIG_DIR, "what.log")
+LLM_LOG_FILE = os.path.join(CONFIG_DIR, "llm.log")
+LOG_MAX_BYTES = 100 * 1024  # 100KB
+
+# ── 默认配置 ──
+DEFAULTS = {
+    "api_key": "",
+    "api_base": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash",
+    "language": "zh",
+    "max_output_chars": "20000",
+    "profile": "default",
+    "custom_instruction": "",
+}
+
+PROFILE_PROMPTS = {
+    "default": "你是 Linux 终端专家。用中文回答，简洁直接，不要客套话。",
+    "pentest": """你是 Linux 终端专家，也熟悉授权渗透测试和 CTF 靶场。
+用中文回答，你的主要任务是总结一些命令（主要是渗透测试命令）的运行结果，并给出建议（下一步或者当前命令可以怎么修改），重点关注信息收集、漏洞线索、下一步枚举/验证命令。""",
+    "dev": """你是 Linux 终端专家，也熟悉开发调试。
+用中文回答，重点关注报错原因、依赖问题、构建/运行修复方法和可直接执行的下一步命令。""",
+    "ops": """你是 Linux 终端专家，也熟悉运维排障。
+用中文回答，重点关注服务状态、网络连通性、权限、资源占用、日志线索和下一步排查命令。""",
+    "custom": "你是 Linux 终端专家。用中文回答，并结合用户自定义方向分析。",
+}
+
+_DEBUG = False  # --debug 标志
+
+# ── 颜色 ──
+class C:
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    RED    = "\033[31m"
+    CYAN   = "\033[36m"
+    RESET  = "\033[0m"
+
+    @staticmethod
+    def off():
+        for attr in ("BOLD", "DIM", "GREEN", "YELLOW", "RED", "CYAN", "RESET"):
+            setattr(C, attr, "")
+
+
+def log(msg, level="INFO"):
+    """写日志到 ~/.what/what.log，-d/--debug 时同步输出到 stderr"""
+    global _DEBUG
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] [{level}] {msg}"
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        # 简单轮转：超过上限则截半
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE, "r", errors="replace") as f:
+                old = f.read()
+            with open(LOG_FILE, "w") as f:
+                f.write(old[-LOG_MAX_BYTES // 2:])
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except (IOError, OSError):
+        pass
+    if _DEBUG:
+        print(f"{C.DIM}[d]{C.RESET} {line}", file=sys.stderr)
+
+
+def llm_log(system_prompt, user_prompt, response):
+    """记录每次 LLM 对话的完整 prompt 和 response 到 ~/.what/llm.log"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "=" * 60
+    entry = f"""{sep}
+[{timestamp}] LLM 对话记录
+{sep}
+>>> SYSTEM:
+{system_prompt}
+
+>>> USER:
+{user_prompt}
+
+<<< RESPONSE ({len(response)} 字符):
+{response}
+{sep}
+"""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        if os.path.exists(LLM_LOG_FILE) and os.path.getsize(LLM_LOG_FILE) > LOG_MAX_BYTES:
+            with open(LLM_LOG_FILE, "r", errors="replace") as f:
+                old = f.read()
+            with open(LLM_LOG_FILE, "w") as f:
+                f.write(old[-LOG_MAX_BYTES // 2:])
+        with open(LLM_LOG_FILE, "a") as f:
+            f.write(entry)
+    except (IOError, OSError):
+        pass
+
+
+def load_config():
+    """加载配置：文件 → 环境变量覆盖"""
+    cfg = dict(DEFAULTS)
+
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip().lower()] = v.strip()
+
+    for key in list(cfg.keys()):
+        env_val = os.environ.get(f"WHAT_{key.upper()}")
+        if env_val:
+            cfg[key] = env_val
+
+    return cfg
+
+
+def strip_ansi(text):
+    """去除 ANSI 转义序列和终端控制字符"""
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
+    text = re.sub(r'\x1b[()][AB012]', '', text)
+    text = re.sub(r'\x1b[\[\]()#;?]*[0-9;]*[a-zA-Z]', '', text)
+    text = text.replace('\r\n', '\n').replace('\r', '')
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text
+
+
+def read_file(path):
+    """安全读取文件内容"""
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (IOError, OSError):
+        return ""
+
+
+def get_last_command_info():
+    """读取上一条命令、退出码和输出"""
+    cmd = read_file(LAST_CMD_FILE)
+    exit_code = read_file(LAST_EXIT_FILE) or "unknown"
+
+    log(f"读取命令: cmd={cmd[:200] if cmd else '(空)'}, exit={exit_code}")
+
+    output = ""
+    start_str = read_file(OUTPUT_START_FILE)
+    end_str = read_file(OUTPUT_END_FILE)
+
+    if start_str and end_str:
+        try:
+            start = int(start_str)
+            end = int(end_str)
+            if os.path.exists(SESSION_LOG) and end > start:
+                with open(SESSION_LOG, "rb") as f:
+                    f.seek(start)
+                    raw = f.read(end - start)
+                output = strip_ansi(raw.decode("utf-8", errors="replace"))
+                output = output.strip()
+                log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
+            elif os.path.exists(SESSION_LOG) and end == start:
+                session_size = os.path.getsize(SESSION_LOG)
+                if session_size <= start:
+                    output = (
+                        "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
+                        "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
+                    )
+                    log(
+                        f"session.log 未增长: start={start}, end={end}, size={session_size}",
+                        "WARN",
+                    )
+                else:
+                    with open(SESSION_LOG, "rb") as f:
+                        f.seek(start)
+                        raw = f.read(session_size - start)
+                    output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                    log(
+                        f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
+                        f"(offset {start}-{session_size})",
+                        "WARN",
+                    )
+            else:
+                log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
+        except (ValueError, IOError, OSError) as e:
+            log(f"读取输出异常: {e}", "ERROR")
+    else:
+        log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
+
+    if not cmd:
+        log("命令为空 — hook 可能未加载", "WARN")
+
+    return cmd, exit_code, output
+
+
+# ══════════════════════════════════════════════════════════════
+# 智能输出提炼 — 本地提取关键信息，减少发给 LLM 的 token
+# ══════════════════════════════════════════════════════════════
+
+# 需要捕获的关键行模式
+ERROR_PATTERNS = [
+    # 通用错误
+    r'(?i)\berr(?:or)?\b',          # error / err
+    r'(?i)\bfatal\b', r'(?i)\bpanic\b',
+    r'(?i)\bfail(?:ed|ure)?\b', r'(?i)\bexception\b',
+    r'(?i)\binvalid\b', r'(?i)\bunknown\b',
+    r'(?i)\b(?:permission\s+)?denied\b', r'(?i)\bnot\s+found\b',
+    r'(?i)\btime\s*out\b', r'(?i)\brefused\b',
+    r'(?i)\bcannot\b', r'(?i)\bcould\s+not\b',
+    r'(?i)\bunrecogni[sz]ed\b', r'(?i)\bmissing\b',
+    r'(?i)\brequired\b', r'(?i)\bunexpected\b',
+    r'(?i)\bwrong\b', r'(?i)\bunable\s+to\b',
+    # 连接相关
+    r'(?i)\bconnection\s+(?:refused|reset|closed|timed?\s*out)\b',
+    r'(?i)\bconnect\b', r'(?i)\bdisconnect(?:ed)?\b',
+    # 系统级
+    r'(?i)\bseg(?:mentation)?\s+fault\b',
+    r'(?i)\bbus\s+error\b', r'(?i)\bcore\s+dumped\b',
+    r'(?i)\btraceback\b', r'(?i)\bbacktrace\b',
+    r'(?i)\bsignal\b', r'(?i)\bkilled\b', r'(?i)\babort(?:ed)?\b',
+    r'(?i)\bout\s+of\s+memory\b', r'(?i)\boom\b',
+    # 命令/文件
+    r'(?i)\bno\s+such\s+file\b',
+    r'(?i)\bcommand\s+not\s+found\b',
+    r'(?i)\bsyntax\s+error\b', r'(?i)\bparse\s+error\b',
+    r'(?i)\bname\s+error\b', r'(?i)\btype\s+error\b',
+    # 中文错误
+    r'错误', r'失败', r'异常', r'禁止', r'拒绝',
+    r'未找到', r'找不到', r'超时', r'无权限',
+]
+
+TIP_PATTERNS = [
+    r'(?i)\btip\b', r'(?i)\bhint\b', r'(?i)\bsuggestion\b',
+    r'(?i)\bdid\s+you\s+mean\b', r'(?i)\bto\s+pass\b',
+    r'(?i)\bfor\s+more\s+information\b',
+    r'(?i)\bsee\b', r'(?i)\brefer\b',
+    # 中文提示
+    r'提示', r'建议', r'用法', r'试试', r'请参考',
+]
+
+WARNING_PATTERNS = [
+    r'(?i)\bwarn(?:ing)?\b', r'(?i)\bdeprecated\b',
+    r'(?i)\bnotice\b', r'(?i)\bcaution\b',
+    r'(?i)\bnote\b', r'(?i)\bwill\s+be\s+removed\b',
+    # 中文警告
+    r'警告', r'注意', r'已弃用', r'将移除',
+]
+
+USAGE_PATTERNS = [
+    r'(?i)^\s*usage\s*:', r'(?i)^\s*用法\s*[：:]',
+]
+
+
+def _match_any(line, patterns):
+    """检查行是否匹配任意模式"""
+    for pat in patterns:
+        if re.search(pat, line):
+            return True
+    return False
+
+
+def smart_extract(output, max_chars=6000):
+    """
+    从命令输出中智能提取，保留关键信息的同时尽量不丢失细节。
+    返回 (extracted_text, summary_dict)
+
+    策略（从激进改为均衡）：
+    1. 短输出 (< max_chars) → 完整返回
+    2. 错误行 → 全部保留，带 ±2 行上下文
+    3. 非错误行 → 均匀采样，保留中间的代表性内容
+    4. 头部和尾部 → 各保留更多行
+    """
+    if len(output) <= max_chars:
+        return output, None
+
+    lines = output.split('\n')
+    total_lines = len(lines)
+    total_chars = len(output)
+
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    head_count = 20
+    tail_count = 15
+    ctx_radius = 2  # 错误行上下文半径
+
+    # ── 分类：标记哪些行需要保留 ──
+    keep = set()
+
+    # 头部和尾部始终保留
+    for i in range(min(head_count, len(lines))):
+        keep.add(i)
+    for i in range(max(0, len(lines) - tail_count), len(lines)):
+        keep.add(i)
+
+    error_lines = []
+    tip_lines = []
+    warning_lines = []
+    usage_lines = []
+    middle_range = range(head_count, len(lines) - tail_count) if len(lines) > head_count + tail_count else range(0, 0)
+
+    for i in middle_range:
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+
+        if _match_any(stripped, ERROR_PATTERNS):
+            error_lines.append((i, stripped))
+            # 保留上下文
+            for j in range(max(0, i - ctx_radius), min(len(lines), i + ctx_radius + 1)):
+                keep.add(j)
+        elif _match_any(stripped, TIP_PATTERNS):
+            tip_lines.append((i, stripped))
+            keep.add(i)
+        elif _match_any(stripped, WARNING_PATTERNS):
+            warning_lines.append((i, stripped))
+            keep.add(i)
+        elif _match_any(stripped, USAGE_PATTERNS):
+            usage_lines.append((i, stripped))
+
+    # ── 均衡采样：中间非关键行也保留一部分 ──
+    # 取中间区域中未被 keep 的行，均匀采样
+    unsampled = [i for i in middle_range if i not in keep]
+    if unsampled:
+        # 采样率：保留约 50 行代表性内容
+        sample_rate = max(1, len(unsampled) // 50)
+        for idx, line_idx in enumerate(unsampled):
+            if idx % sample_rate == 0:
+                keep.add(line_idx)
+
+    # ── 按行号排序构建输出 ──
+    kept_lines = []
+    last_idx = -2
+    for i in sorted(keep):
+        if i > last_idx + 1:
+            kept_lines.append(f";;; [跳过 {i - last_idx - 1} 行]")
+        kept_lines.append(lines[i])
+        last_idx = i
+
+    # 去重（Usage 行通常很多重复）
+    if usage_lines and len(usage_lines) > 3:
+        kept_lines = _dedup_usage(kept_lines)
+
+    extracted = '\n'.join(kept_lines)
+
+    # 最终截断保护
+    if len(extracted) > max_chars + 2000:
+        extracted = extracted[:max_chars] + '\n;;; [已截断]'
+
+    summary = {
+        'total_lines': total_lines,
+        'total_chars': total_chars,
+        'kept_lines': len(keep),
+        'error_count': len(error_lines),
+        'warning_count': len(warning_lines),
+        'has_tips': len(tip_lines) > 0,
+        'sampled': len(unsampled) > 0,
+    }
+
+    return extracted, summary
+
+
+def _dedup_usage(lines):
+    """去除连续重复行（usage/help 常见）"""
+    result = []
+    prev = None
+    streak = 0
+    for line in lines:
+        if line == prev:
+            streak += 1
+            if streak == 3:
+                result.append(';;; [重复行已省略]')
+            elif streak < 3:
+                result.append(line)
+        else:
+            streak = 0
+            prev = line
+            result.append(line)
+    return result
+
+
+def truncate_output(output, max_chars):
+    """按字符上限保留头尾，返回总长度不超过 max_chars 的文本。"""
+    if max_chars <= 0 or len(output) <= max_chars:
+        return output
+
+    marker = f"\n;;; [中间超出 {max_chars} 字符上限，已截断]\n"
+    if len(marker) >= max_chars:
+        return output[:max_chars]
+
+    available = max_chars - len(marker)
+    head_len = available // 2
+    tail_len = available - head_len
+    return output[:head_len] + marker + output[-tail_len:]
+
+
+def _max_output_chars(cfg):
+    try:
+        return int(cfg.get("max_output_chars", DEFAULTS["max_output_chars"]))
+    except (TypeError, ValueError):
+        return int(DEFAULTS["max_output_chars"])
+
+
+def build_system_prompt(cfg):
+    """根据配置中的工作方向生成 system prompt。"""
+    profile = cfg.get("profile", "default").strip().lower() or "default"
+    return PROFILE_PROMPTS.get(profile, PROFILE_PROMPTS["default"])
+
+
+def prepare_output(raw_output, cfg, use_smart=False):
+    """准备要发送给 LLM 的输出，并返回处理元数据。"""
+    raw_output = raw_output or ""
+    original_chars = len(raw_output)
+
+    if use_smart and raw_output:
+        output, summary = smart_extract(raw_output)
+        return output, summary, {
+            "mode": "smart",
+            "label": "智能缩减",
+            "original_chars": original_chars,
+            "sent_chars": len(output),
+        }
+
+    max_chars = _max_output_chars(cfg)
+    output = truncate_output(raw_output, max_chars)
+    mode = "truncated" if len(output) < original_chars else "full"
+    label = "已截断，保留头尾" if mode == "truncated" else "完整输出"
+    return output, None, {
+        "mode": mode,
+        "label": label,
+        "original_chars": original_chars,
+        "sent_chars": len(output),
+    }
+
+
+def classify_result(exit_code, summary):
+    """根据退出码和智能缩减摘要判断结果类型。"""
+    exit_success = (exit_code == "0")
+    if not exit_success and summary and summary.get("error_count", 0) > 0:
+        return "失败且检测到错误"
+    if not exit_success:
+        return "失败"
+    if summary and summary.get("warning_count", 0) > 0:
+        return "成功但有警告"
+    return "成功"
+
+
+def build_sample_note(summary):
+    """生成人类可读的智能缩减说明。"""
+    if not summary:
+        return ""
+    parts = [
+        f"原始 {summary['total_lines']} 行 / {summary['total_chars']} 字符",
+        f"保留 {summary['kept_lines']} 行",
+        f"错误 {summary['error_count']} 条",
+        f"警告 {summary['warning_count']} 条",
+    ]
+    if summary.get("sampled"):
+        parts.append("包含均匀采样")
+    return "；".join(parts)
+
+
+def build_answer_requirements(cfg, result_type):
+    """根据 profile 和结果类型生成回答要求。"""
+    requirements = [
+        "先用一句话说明结论",
+        "列出关键发现",
+        "给出下一步建议",
+    ]
+
+    if result_type.startswith("失败"):
+        requirements.append("如果能修复，给出最短可执行修复命令")
+    elif result_type == "成功但有警告":
+        requirements.append("说明警告是否需要处理")
+
+    if cfg.get("profile", "default").strip().lower() == "pentest":
+        requirements.append("给出下一步枚举/验证命令，并提醒仅限授权环境")
+
+    custom_instruction = cfg.get("custom_instruction", "").strip()
+    if custom_instruction:
+        requirements.append(f"用户偏好: {custom_instruction}")
+
+    return requirements
+
+
+def build_user_prompt(cmd, exit_code, output, result_type, summary, meta, user_question, cfg):
+    """构建结构化 user prompt。"""
+    output_text = output if output else "(无输出)"
+    lines = [
+        "请分析这条终端命令的结果。",
+        "",
+        "上下文:",
+        f"- 命令: `{cmd}`",
+        f"- 退出码: {exit_code}",
+        f"- 结果类型: {result_type}",
+        f"- 输出处理: {meta['label']} ({meta['sent_chars']}/{meta['original_chars']} 字符)",
+    ]
+
+    sample_note = build_sample_note(summary)
+    if sample_note:
+        lines.append(f"- 智能缩减摘要: {sample_note}")
+
+    if user_question:
+        lines.append(f"- 用户追问: {user_question}")
+
+    lines.extend([
+        "",
+        "命令输出:",
+        "```text",
+        output_text,
+        "```",
+        "",
+        "请按以下要求回答:",
+    ])
+
+    for index, requirement in enumerate(build_answer_requirements(cfg, result_type), 1):
+        lines.append(f"{index}. {requirement}")
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+# Prompt 构建 — 根据输出内容自适应调整
+# ══════════════════════════════════════════════════════════════
+
+def build_prompt(cmd, exit_code, raw_output, user_question=None, use_smart=False, cfg=None):
+    """构建发送给 LLM 的 system/user prompt。"""
+    cfg = cfg or DEFAULTS
+    output, summary, meta = prepare_output(raw_output, cfg, use_smart)
+    result_type = classify_result(exit_code, summary)
+    system = build_system_prompt(cfg)
+    prompt = build_user_prompt(
+        cmd, exit_code, output, result_type, summary, meta, user_question, cfg
+    )
+    return system, prompt
+
+
+def _api_request(cfg, system_prompt, user_prompt, stream=True):
+    """发送 API 请求，返回 response 对象"""
+    api_base = cfg["api_base"].rstrip("/")
+    url = f"{api_base}/chat/completions"
+
+    payload = json.dumps({
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": stream,
+    }).encode("utf-8")
+
+    log(f"API 请求: model={cfg['model']}, endpoint={api_base}, "
+        f"prompt_size={len(user_prompt)}chars, stream={stream}")
+
+    req = Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {cfg['api_key']}",
+    })
+
+    try:
+        return urlopen(req, timeout=60)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        log(f"API HTTP {e.code}: {body[:500]}", "ERROR")
+        print(f"\n{C.RED}API 错误 ({e.code}):{C.RESET} {body}", file=sys.stderr)
+        sys.exit(1)
+    except URLError as e:
+        log(f"API 连接失败: {e.reason}", "ERROR")
+        print(f"\n{C.RED}连接失败:{C.RESET} {e.reason}", file=sys.stderr)
+        print(f"请检查 api_base 配置: {cfg['api_base']}", file=sys.stderr)
+        sys.exit(1)
+
+
+def stream_llm(cfg, system_prompt, user_prompt):
+    """流式输出 API 响应，返回完整文本"""
+    resp = _api_request(cfg, system_prompt, user_prompt, stream=True)
+
+    buffer = ""
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            delta = chunk["choices"][0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                print(content, end="", flush=True)
+                buffer += content
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+    print()
+    resp.close()
+    log(f"流式响应完成: {len(buffer)} 字符")
+    llm_log(system_prompt, user_prompt, buffer)
+    return buffer
+
+
+def call_llm_nonstream(cfg, system_prompt, user_prompt):
+    """非流式调用 API，返回完整响应文本"""
+    resp = _api_request(cfg, system_prompt, user_prompt, stream=False)
+
+    body = resp.read().decode("utf-8", errors="replace")
+    resp.close()
+
+    try:
+        data = json.loads(body)
+        text = data["choices"][0]["message"]["content"]
+        log(f"非流式响应完成: {len(text)} 字符")
+        llm_log(system_prompt, user_prompt, text)
+        return text
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        log(f"解析 API 响应失败: {body[:500]}", "ERROR")
+        print(f"\n{C.RED}解析响应失败:{C.RESET} {body[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def render_markdown(text):
+    """用 rich 库渲染 Markdown 到终端"""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        console = Console()
+        md = Markdown(text)
+        console.print(md)
+    except ImportError:
+        print(f"{C.YELLOW}提示: 安装 rich 库以获得 Markdown 渲染效果:{C.RESET}")
+        print("  pip install rich")
+        print("")
+        print(text)
+
+
+# ══════════════════════════════════════════════════════════════
+# 命令
+# ══════════════════════════════════════════════════════════════
+
+def cmd_show(cmd, exit_code, output):
+    """显示捕获到的命令和输出（调试用）"""
+    print(f"{C.BOLD}命令:{C.RESET} {cmd}")
+    print(f"{C.BOLD}退出码:{C.RESET} {exit_code}")
+    print(f"{C.BOLD}输出 ({len(output)} 字符):{C.RESET}")
+    print(output if output else "(无输出)")
+
+
+def cmd_setup():
+    """交互式配置向导"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    print(f"{C.CYAN}=== what 配置向导 ==={C.RESET}\n")
+
+    cfg = load_config()
+
+    api_base = input(f"API Base URL [{cfg['api_base']}]: ").strip()
+    if not api_base:
+        api_base = cfg["api_base"]
+
+    api_key = input(f"API Key [{cfg['api_key'][:8] + '...' if len(cfg['api_key']) > 8 else cfg['api_key']}]: ").strip()
+    if not api_key:
+        api_key = cfg["api_key"]
+
+    model = input(f"模型名称 [{cfg['model']}]: ").strip()
+    if not model:
+        model = cfg["model"]
+
+    max_output_chars = input(f"最大发送输出字符数 [{cfg['max_output_chars']}]: ").strip()
+    if not max_output_chars:
+        max_output_chars = cfg["max_output_chars"]
+
+    print("\n请选择你的主要使用方向:")
+    print("1) 通用")
+    print("2) 渗透测试/靶场")
+    print("3) 开发调试")
+    print("4) 运维排障")
+    print("5) 自定义")
+    profile_map = {
+        "1": "default",
+        "2": "pentest",
+        "3": "dev",
+        "4": "ops",
+        "5": "custom",
+    }
+    current_profile = cfg.get("profile", "default")
+    profile_choice = input(f"方向 [{current_profile}]: ").strip()
+    profile = profile_map.get(profile_choice, profile_choice or current_profile)
+    if profile not in PROFILE_PROMPTS:
+        print(f"{C.YELLOW}未识别的方向，使用 default{C.RESET}")
+        profile = "default"
+
+    custom_instruction = cfg.get("custom_instruction", "")
+    if profile == "custom" or input("是否添加自定义分析偏好? [y/N] ").strip().lower() in ("y", "yes"):
+        entered = input("自定义分析偏好: ").strip()
+        custom_instruction = entered or custom_instruction
+
+    with open(CONFIG_FILE, "w") as f:
+        f.write(f"# what 配置文件\n")
+        f.write(f"# 支持 OpenAI 兼容的 API（OpenAI、DeepSeek、Ollama 等）\n\n")
+        f.write(f"api_base = {api_base}\n")
+        f.write(f"api_key = {api_key}\n")
+        f.write(f"model = {model}\n")
+        f.write(f"max_output_chars = {max_output_chars}\n")
+        f.write(f"profile = {profile}\n")
+        f.write(f"custom_instruction = {custom_instruction}\n")
+
+    print(f"\n{C.GREEN}配置已保存到 {CONFIG_FILE}{C.RESET}")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="what",
+        description="分析终端命令的执行结果（自动捕获上一条命令）",
+        epilog="""示例:
+  what                              分析上一条命令（默认 Markdown 非流式）
+  what -q "这个错误怎么修"            带自定义问题（推荐）
+  what --show                       查看捕获到的原始信息
+  what --smart                      启用智能缩减后再发送给 LLM
+  what --stream                     流式纯文本输出
+  what --cmd 'ls -la /' --output-file /tmp/out.txt --exit-code 0  手动测试""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("rest", nargs="*", help=argparse.SUPPRESS)  # 向后兼容
+    parser.add_argument("-q", "--question", help="自定义问题（推荐，用引号包裹）")
+    parser.add_argument("--show", action="store_true", help="查看捕获到的命令和输出（不调用 LLM）")
+    parser.add_argument("--setup", action="store_true", help="交互式配置向导")
+    parser.add_argument("--no-color", action="store_true", help="禁用彩色输出")
+    parser.add_argument("--smart", action="store_true", help="启用智能缩减，只发送提炼后的关键输出")
+    parser.add_argument("--raw", action="store_true", help="兼容旧参数：当前默认就是发送完整输出")
+    parser.add_argument("--md", action="store_true", help="兼容旧参数：当前默认就是 Markdown 渲染")
+    parser.add_argument("--plain", action="store_true", help="纯文本输出，禁用 Markdown 渲染")
+    parser.add_argument("--stream", action="store_true", help="流式纯文本输出")
+    parser.add_argument("-d", "--debug", action="store_true", help="调试模式：日志同步输出到 stderr")
+    # 测试模式（无需安装 hook）
+    parser.add_argument("--cmd", help="手动指定命令文本（测试用，无需 hook）")
+    parser.add_argument("--output", help="手动指定命令输出文本（测试用）")
+    parser.add_argument("--output-file", help="从文件读取命令输出（测试用）")
+    parser.add_argument("--exit-code", default="0", help="手动指定退出码（测试用，默认 0）")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
+
+    global _DEBUG
+    _DEBUG = args.debug
+
+    if _DEBUG:
+        log("=== what 启动 ===")
+
+    if args.no_color:
+        C.off()
+
+    # ── 配置向导 ──
+    if args.setup:
+        cmd_setup()
+        return
+
+    # ── 加载配置 ──
+    cfg = load_config()
+    log(f"配置: model={cfg['model']}, base={cfg['api_base']}, "
+        f"profile={cfg.get('profile', 'default')}, "
+        f"key={'已设置' if cfg.get('api_key') else '未设置'}")
+
+    # ── 获取命令信息：手动测试模式 vs 自动捕获模式 ──
+    manual_mode = bool(args.cmd or args.output or args.output_file)
+    if manual_mode:
+        cmd = args.cmd or "(手动指定)"
+        exit_code = args.exit_code
+        log(f"手动模式: cmd={cmd}, exit_code={exit_code}")
+        if args.output_file:
+            with open(args.output_file) as f:
+                raw = f.read()
+            output = strip_ansi(raw).strip()
+        elif args.output:
+            output = args.output
+        else:
+            output = ""
+        log(f"手动模式输出: {len(output)} 字符")
+    else:
+        cmd, exit_code, output = get_last_command_info()
+        if not cmd:
+            log("未找到上一条命令，退出", "ERROR")
+            print(f"{C.RED}未找到上一条命令。{C.RESET}", file=sys.stderr)
+            print("请确保已在 shell 中加载 what-hook.sh", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("或者使用手动测试模式:", file=sys.stderr)
+            print("  what --cmd '你的命令' --output '命令的输出' --exit-code 1", file=sys.stderr)
+            sys.exit(1)
+
+    # ── 查看模式 ──
+    if args.show:
+        cmd_show(cmd, exit_code, output)
+        return
+
+    # ── 检查 API Key ──
+    if not cfg.get("api_key"):
+        print(f"{C.RED}未配置 API Key。{C.RESET}", file=sys.stderr)
+        print(f"请运行 what --setup 进行配置，或设置环境变量 WHAT_API_KEY", file=sys.stderr)
+        sys.exit(1)
+
+    # ── 构建提示 ──
+    user_question = args.question or (" ".join(args.rest) if args.rest else None)
+    use_smart = args.smart
+    system_prompt, user_prompt = build_prompt(
+        cmd, exit_code, output, user_question, use_smart, cfg
+    )
+
+    # ── 显示分析头 ──
+    print(f"\n{C.DIM}{'─' * 50}{C.RESET}")
+    print(f"{C.CYAN}$ {cmd}{C.RESET}  {C.DIM}(exit: {exit_code}){C.RESET}")
+    if use_smart and len(output) > 6000:
+        print(f"{C.DIM}(原始 {len(output)} 字符，智能缩减后 prompt ~{len(user_prompt)} 字符){C.RESET}")
+    elif not use_smart and len(output) > _max_output_chars(cfg):
+        print(f"{C.DIM}(原始 {len(output)} 字符，按 max_output_chars 保留头尾){C.RESET}")
+    print(f"{C.DIM}{'─' * 50}{C.RESET}\n")
+
+    # ── 调用 LLM ──
+    if args.stream:
+        stream_llm(cfg, system_prompt, user_prompt)
+    else:
+        text = call_llm_nonstream(cfg, system_prompt, user_prompt)
+        if args.plain:
+            print(text)
+        else:
+            render_markdown(text)
+    print()
+
+    log("完成")
+
+
+if __name__ == "__main__":
+    main()

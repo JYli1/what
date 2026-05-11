@@ -12,6 +12,7 @@ import argparse
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+import platform
 
 # ── 路径常量 ──
 CONFIG_DIR = os.path.expanduser("~/.what")
@@ -24,6 +25,12 @@ OUTPUT_END_FILE = os.path.join(CONFIG_DIR, "output_end")
 LOG_FILE = os.path.join(CONFIG_DIR, "what.log")
 LLM_LOG_FILE = os.path.join(CONFIG_DIR, "llm.log")
 LOG_MAX_BYTES = 100 * 1024  # 100KB
+
+IS_WINDOWS = platform.system() == "Windows"
+if IS_WINDOWS:
+    OUTPUT_FILE = os.path.join(CONFIG_DIR, "output.txt")
+else:
+    OUTPUT_FILE = None
 
 # ── 默认配置 ──
 DEFAULTS = {
@@ -166,47 +173,53 @@ def get_last_command_info():
     log(f"读取命令: cmd={cmd[:200] if cmd else '(空)'}, exit={exit_code}")
 
     output = ""
-    start_str = read_file(OUTPUT_START_FILE)
-    end_str = read_file(OUTPUT_END_FILE)
+    if IS_WINDOWS:
+        output = read_file(OUTPUT_FILE)
+        if output:
+            output = strip_ansi(output).strip()
+        log(f"读取输出 (Windows): {len(output)} 字符")
+    else:
+        start_str = read_file(OUTPUT_START_FILE)
+        end_str = read_file(OUTPUT_END_FILE)
 
-    if start_str and end_str:
-        try:
-            start = int(start_str)
-            end = int(end_str)
-            if os.path.exists(SESSION_LOG) and end > start:
-                with open(SESSION_LOG, "rb") as f:
-                    f.seek(start)
-                    raw = f.read(end - start)
-                output = strip_ansi(raw.decode("utf-8", errors="replace"))
-                output = output.strip()
-                log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
-            elif os.path.exists(SESSION_LOG) and end == start:
-                session_size = os.path.getsize(SESSION_LOG)
-                if session_size <= start:
-                    output = (
-                        "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
-                        "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
-                    )
-                    log(
-                        f"session.log 未增长: start={start}, end={end}, size={session_size}",
-                        "WARN",
-                    )
-                else:
+        if start_str and end_str:
+            try:
+                start = int(start_str)
+                end = int(end_str)
+                if os.path.exists(SESSION_LOG) and end > start:
                     with open(SESSION_LOG, "rb") as f:
                         f.seek(start)
-                        raw = f.read(session_size - start)
-                    output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
-                    log(
-                        f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
-                        f"(offset {start}-{session_size})",
-                        "WARN",
-                    )
-            else:
-                log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
-        except (ValueError, IOError, OSError) as e:
-            log(f"读取输出异常: {e}", "ERROR")
-    else:
-        log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
+                        raw = f.read(end - start)
+                    output = strip_ansi(raw.decode("utf-8", errors="replace"))
+                    output = output.strip()
+                    log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
+                elif os.path.exists(SESSION_LOG) and end == start:
+                    session_size = os.path.getsize(SESSION_LOG)
+                    if session_size <= start:
+                        output = (
+                            "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
+                            "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
+                        )
+                        log(
+                            f"session.log 未增长: start={start}, end={end}, size={session_size}",
+                            "WARN",
+                        )
+                    else:
+                        with open(SESSION_LOG, "rb") as f:
+                            f.seek(start)
+                            raw = f.read(session_size - start)
+                        output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                        log(
+                            f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
+                            f"(offset {start}-{session_size})",
+                            "WARN",
+                        )
+                else:
+                    log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
+            except (ValueError, IOError, OSError) as e:
+                log(f"读取输出异常: {e}", "ERROR")
+        else:
+            log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
 
     if not cmd:
         log("命令为空 — hook 可能未加载", "WARN")

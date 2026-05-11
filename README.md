@@ -2,7 +2,7 @@
 
 > 让终端报错自己解释自己。
 
-`what` 是一个终端命令智能分析工具：执行任意命令后输入 `what`，它会自动读取上一条命令、退出码和终端输出，交给 LLM 分析，然后用中文告诉你发生了什么、为什么失败、下一步该怎么做。
+`what` 是一个终端命令智能分析工具（支持 Linux / Windows PowerShell）：执行任意命令后输入 `what`，它会自动读取上一条命令、退出码和终端输出，交给 LLM 分析，然后用中文告诉你发生了什么、为什么失败、下一步该怎么做。
 
 它适合这些场景：
 
@@ -44,6 +44,20 @@ cd what
 what --setup          # 配置 API Key
 source ~/.zshrc       # zsh 用户
 source ~/.bashrc      # bash 用户
+```
+
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/your/what.git
+cd what\windows
+.\install.ps1
+```
+
+安装后：
+```powershell
+what --setup          # 配置 API Key
+. $PROFILE            # 重新加载配置（或重启 PowerShell）
 ```
 
 ## 使用
@@ -217,7 +231,7 @@ cat ~/.what/what.log       # 查看完整日志
 ## 依赖
 
 - Python 3
-- shell: zsh 或 bash
+- shell: zsh / bash (Linux) 或 PowerShell 5.1+ (Windows)
 - `rich`：安装脚本自动装到虚拟环境，用于默认 Markdown 渲染
 
 ## 文件布局
@@ -235,6 +249,11 @@ cat ~/.what/what.log       # 查看完整日志
 
 ~/.local/bin/
 └── what            # Shell wrapper → 调用 venv 中的 Python
+
+windows/            # Windows PowerShell 支持
+├── what-hook.psm1  # PowerShell 钩子模块
+├── what.ps1        # PowerShell what 函数
+└── install.ps1     # PowerShell 安装脚本
 ```
 
 ## 原理

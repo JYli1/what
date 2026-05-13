@@ -28,9 +28,7 @@ LOG_MAX_BYTES = 100 * 1024  # 100KB
 
 IS_WINDOWS = platform.system() == "Windows"
 if IS_WINDOWS:
-    OUTPUT_FILE = os.path.join(CONFIG_DIR, "output.txt")
-else:
-    OUTPUT_FILE = None
+    SESSION_LOG = os.path.join(CONFIG_DIR, "transcript.txt")
 
 # ── 默认配置 ──
 DEFAULTS = {
@@ -44,14 +42,14 @@ DEFAULTS = {
 }
 
 PROFILE_PROMPTS = {
-    "default": "你是 Linux 终端专家。用中文回答，简洁直接，不要客套话。",
-    "pentest": """你是 Linux 终端专家，也熟悉授权渗透测试和 CTF 靶场。
+    "default": "你是终端专家。用中文回答，简洁直接，不要客套话。",
+    "pentest": """你是终端专家，也熟悉授权渗透测试和 CTF 靶场。
 用中文回答，你的主要任务是总结一些命令（主要是渗透测试命令）的运行结果，并给出建议（下一步或者当前命令可以怎么修改），重点关注信息收集、漏洞线索、下一步枚举/验证命令。""",
-    "dev": """你是 Linux 终端专家，也熟悉开发调试。
+    "dev": """你是终端专家，也熟悉开发调试。
 用中文回答，重点关注报错原因、依赖问题、构建/运行修复方法和可直接执行的下一步命令。""",
-    "ops": """你是 Linux 终端专家，也熟悉运维排障。
+    "ops": """你是终端专家，也熟悉运维排障。
 用中文回答，重点关注服务状态、网络连通性、权限、资源占用、日志线索和下一步排查命令。""",
-    "custom": "你是 Linux 终端专家。用中文回答，并结合用户自定义方向分析。",
+    "custom": "你是终端专家。用中文回答，并结合用户自定义方向分析。",
 }
 
 _DEBUG = False  # --debug 标志
@@ -81,11 +79,11 @@ def log(msg, level="INFO"):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         # 简单轮转：超过上限则截半
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
-            with open(LOG_FILE, "r", errors="replace") as f:
+            with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
                 old = f.read()
-            with open(LOG_FILE, "w") as f:
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(old[-LOG_MAX_BYTES // 2:])
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except (IOError, OSError):
         pass
@@ -113,11 +111,11 @@ def llm_log(system_prompt, user_prompt, response):
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         if os.path.exists(LLM_LOG_FILE) and os.path.getsize(LLM_LOG_FILE) > LOG_MAX_BYTES:
-            with open(LLM_LOG_FILE, "r", errors="replace") as f:
+            with open(LLM_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
                 old = f.read()
-            with open(LLM_LOG_FILE, "w") as f:
+            with open(LLM_LOG_FILE, "w", encoding="utf-8") as f:
                 f.write(old[-LOG_MAX_BYTES // 2:])
-        with open(LLM_LOG_FILE, "a") as f:
+        with open(LLM_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(entry)
     except (IOError, OSError):
         pass
@@ -128,7 +126,7 @@ def load_config():
     cfg = dict(DEFAULTS)
 
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -159,7 +157,7 @@ def strip_ansi(text):
 def read_file(path):
     """安全读取文件内容"""
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read().strip()
     except (IOError, OSError):
         return ""
@@ -173,53 +171,47 @@ def get_last_command_info():
     log(f"读取命令: cmd={cmd[:200] if cmd else '(空)'}, exit={exit_code}")
 
     output = ""
-    if IS_WINDOWS:
-        output = read_file(OUTPUT_FILE)
-        if output:
-            output = strip_ansi(output).strip()
-        log(f"读取输出 (Windows): {len(output)} 字符")
-    else:
-        start_str = read_file(OUTPUT_START_FILE)
-        end_str = read_file(OUTPUT_END_FILE)
+    start_str = read_file(OUTPUT_START_FILE)
+    end_str = read_file(OUTPUT_END_FILE)
 
-        if start_str and end_str:
-            try:
-                start = int(start_str)
-                end = int(end_str)
-                if os.path.exists(SESSION_LOG) and end > start:
+    if start_str and end_str:
+        try:
+            start = int(start_str)
+            end = int(end_str)
+            if os.path.exists(SESSION_LOG) and end > start:
+                with open(SESSION_LOG, "rb") as f:
+                    f.seek(start)
+                    raw = f.read(end - start)
+                output = strip_ansi(raw.decode("utf-8", errors="replace"))
+                output = output.strip()
+                log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
+            elif os.path.exists(SESSION_LOG) and end == start:
+                session_size = os.path.getsize(SESSION_LOG)
+                if session_size <= start:
+                    output = (
+                        "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
+                        "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
+                    )
+                    log(
+                        f"session.log 未增长: start={start}, end={end}, size={session_size}",
+                        "WARN",
+                    )
+                else:
                     with open(SESSION_LOG, "rb") as f:
                         f.seek(start)
-                        raw = f.read(end - start)
-                    output = strip_ansi(raw.decode("utf-8", errors="replace"))
-                    output = output.strip()
-                    log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
-                elif os.path.exists(SESSION_LOG) and end == start:
-                    session_size = os.path.getsize(SESSION_LOG)
-                    if session_size <= start:
-                        output = (
-                            "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
-                            "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
-                        )
-                        log(
-                            f"session.log 未增长: start={start}, end={end}, size={session_size}",
-                            "WARN",
-                        )
-                    else:
-                        with open(SESSION_LOG, "rb") as f:
-                            f.seek(start)
-                            raw = f.read(session_size - start)
-                        output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
-                        log(
-                            f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
-                            f"(offset {start}-{session_size})",
-                            "WARN",
-                        )
-                else:
-                    log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
-            except (ValueError, IOError, OSError) as e:
-                log(f"读取输出异常: {e}", "ERROR")
-        else:
-            log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
+                        raw = f.read(session_size - start)
+                    output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                    log(
+                        f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
+                        f"(offset {start}-{session_size})",
+                        "WARN",
+                    )
+            else:
+                log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
+        except (ValueError, IOError, OSError) as e:
+            log(f"读取输出异常: {e}", "ERROR")
+    else:
+        log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
 
     if not cmd:
         log("命令为空 — hook 可能未加载", "WARN")
@@ -728,7 +720,7 @@ def cmd_setup():
         entered = input("自定义分析偏好: ").strip()
         custom_instruction = entered or custom_instruction
 
-    with open(CONFIG_FILE, "w") as f:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write(f"# what 配置文件\n")
         f.write(f"# 支持 OpenAI 兼容的 API（OpenAI、DeepSeek、Ollama 等）\n\n")
         f.write(f"api_base = {api_base}\n")
@@ -803,7 +795,7 @@ def main():
         exit_code = args.exit_code
         log(f"手动模式: cmd={cmd}, exit_code={exit_code}")
         if args.output_file:
-            with open(args.output_file) as f:
+            with open(args.output_file, encoding="utf-8") as f:
                 raw = f.read()
             output = strip_ansi(raw).strip()
         elif args.output:

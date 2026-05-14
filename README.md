@@ -62,6 +62,8 @@ source ~/.bashrc      # bash 用户
 
 ### Windows (PowerShell)
 
+> **推荐使用 Linux**。Windows 版功能受限，见下方说明。
+
 ```powershell
 git clone https://github.com/your/what.git
 cd what\windows
@@ -73,6 +75,23 @@ cd what\windows
 what --setup          # 配置 API Key
 . $PROFILE            # 重新加载配置（或重启 PowerShell）
 ```
+
+#### Windows 与 Linux 的功能差距
+
+| 功能 | Linux | Windows |
+|------|-------|---------|
+| 命令文本捕获 | hook 实时记录 | Get-History 读取，准确 |
+| 退出码捕获 | 精确 | 基本准确，部分内置命令可能偏差 |
+| 输出捕获 | `script` 录制，零侵入 | **重新执行命令**来捕获输出 |
+| 副作用风险 | 无 | **有**：重执行会再次运行命令，不适合有副作用的操作（如删除、写入、网络请求） |
+| 交互式命令 | 支持（录制终端） | 不支持（重执行会卡住） |
+| 输出完整性 | 完整 | 与原始执行结果一致，但颜色/进度条等 ANSI 序列会被过滤 |
+
+**Windows 使用建议**：
+
+- 适合分析只读命令（`ls`、`cat`、`ping`、`nmap` 等）。
+- 避免对有副作用的命令使用 `what`（如 `rm`、`git push`、`curl -X POST`）。
+- 如果在 Windows 上需要完整功能，推荐使用 WSL2 + Linux 版本。
 
 ## 更新
 

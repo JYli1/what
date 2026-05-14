@@ -22,6 +22,7 @@ LAST_CMD_FILE = os.path.join(CONFIG_DIR, "last_cmd")
 LAST_EXIT_FILE = os.path.join(CONFIG_DIR, "last_exit")
 OUTPUT_START_FILE = os.path.join(CONFIG_DIR, "output_start")
 OUTPUT_END_FILE = os.path.join(CONFIG_DIR, "output_end")
+LAST_OUTPUT_FILE = os.path.join(CONFIG_DIR, "last_output")
 LOG_FILE = os.path.join(CONFIG_DIR, "what.log")
 LLM_LOG_FILE = os.path.join(CONFIG_DIR, "llm.log")
 LOG_MAX_BYTES = 100 * 1024  # 100KB
@@ -155,9 +156,9 @@ def strip_ansi(text):
 
 
 def read_file(path):
-    """安全读取文件内容"""
+    """安全读取文件内容（自动去除 BOM）"""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return f.read().strip()
     except (IOError, OSError):
         return ""
@@ -171,47 +172,74 @@ def get_last_command_info():
     log(f"读取命令: cmd={cmd[:200] if cmd else '(空)'}, exit={exit_code}")
 
     output = ""
-    start_str = read_file(OUTPUT_START_FILE)
-    end_str = read_file(OUTPUT_END_FILE)
 
-    if start_str and end_str:
-        try:
-            start = int(start_str)
-            end = int(end_str)
-            if os.path.exists(SESSION_LOG) and end > start:
-                with open(SESSION_LOG, "rb") as f:
-                    f.seek(start)
-                    raw = f.read(end - start)
-                output = strip_ansi(raw.decode("utf-8", errors="replace"))
-                output = output.strip()
-                log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
-            elif os.path.exists(SESSION_LOG) and end == start:
-                session_size = os.path.getsize(SESSION_LOG)
-                if session_size <= start:
-                    output = (
-                        "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
-                        "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
-                    )
-                    log(
-                        f"session.log 未增长: start={start}, end={end}, size={session_size}",
-                        "WARN",
-                    )
-                else:
+    if IS_WINDOWS:
+        # Windows: 重新执行命令来捕获输出
+        if cmd:
+            try:
+                import subprocess
+                import locale
+                sys_encoding = locale.getpreferredencoding(False) or "gbk"
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", cmd],
+                    capture_output=True, timeout=30,
+                )
+                raw_out = result.stdout.decode(sys_encoding, errors="replace")
+                raw_err = result.stderr.decode(sys_encoding, errors="replace")
+                output = (raw_out + raw_err)
+                output = strip_ansi(output).strip()
+                if result.returncode != 0 and exit_code == "0":
+                    exit_code = str(result.returncode)
+                log(f"Windows 重执行捕获输出: {len(output)} 字符")
+            except subprocess.TimeoutExpired:
+                output = "[what 诊断] 重执行命令超时（30秒）"
+                log("重执行命令超时", "WARN")
+            except (IOError, OSError) as e:
+                output = f"[what 诊断] 重执行命令失败: {e}"
+                log(f"重执行命令失败: {e}", "ERROR")
+    else:
+        # Linux: 从 session.log 按偏移量读取
+        start_str = read_file(OUTPUT_START_FILE)
+        end_str = read_file(OUTPUT_END_FILE)
+
+        if start_str and end_str:
+            try:
+                start = int(start_str)
+                end = int(end_str)
+                if os.path.exists(SESSION_LOG) and end > start:
                     with open(SESSION_LOG, "rb") as f:
                         f.seek(start)
-                        raw = f.read(session_size - start)
-                    output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
-                    log(
-                        f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
-                        f"(offset {start}-{session_size})",
-                        "WARN",
-                    )
-            else:
-                log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
-        except (ValueError, IOError, OSError) as e:
-            log(f"读取输出异常: {e}", "ERROR")
-    else:
-        log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
+                        raw = f.read(end - start)
+                    output = strip_ansi(raw.decode("utf-8", errors="replace"))
+                    output = output.strip()
+                    log(f"读取输出: {len(output)} 字符 (offset {start}-{end})")
+                elif os.path.exists(SESSION_LOG) and end == start:
+                    session_size = os.path.getsize(SESSION_LOG)
+                    if session_size <= start:
+                        output = (
+                            "[what 诊断] session.log 未增长，未捕获到命令输出。\n"
+                            "请重新打开终端，或执行: unset __WHAT_RECORDING; source ~/.what/what-hook.sh"
+                        )
+                        log(
+                            f"session.log 未增长: start={start}, end={end}, size={session_size}",
+                            "WARN",
+                        )
+                    else:
+                        with open(SESSION_LOG, "rb") as f:
+                            f.seek(start)
+                            raw = f.read(session_size - start)
+                        output = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                        log(
+                            f"output_end 未更新，回退读取到文件末尾: {len(output)} 字符 "
+                            f"(offset {start}-{session_size})",
+                            "WARN",
+                        )
+                else:
+                    log(f"session.log 不可用: start={start_str}, end={end_str}", "WARN")
+            except (ValueError, IOError, OSError) as e:
+                log(f"读取输出异常: {e}", "ERROR")
+        else:
+            log(f"output_start/end 为空: start={start_str}, end={end_str}", "WARN")
 
     if not cmd:
         log("命令为空 — hook 可能未加载", "WARN")
@@ -489,9 +517,9 @@ def build_sample_note(summary):
 def build_answer_requirements(cfg, result_type):
     """根据 profile 和结果类型生成回答要求。"""
     requirements = [
-        "先用一句话说明结论",
-        "列出关键发现",
-        "给出下一步建议",
+        "第一行立即给出一句话结论（不要任何前缀标题）",
+        "然后列出关键发现",
+        "最后给出下一步建议",
     ]
 
     if result_type.startswith("失败"):
@@ -597,11 +625,8 @@ def _api_request(cfg, system_prompt, user_prompt, stream=True):
         sys.exit(1)
 
 
-def stream_llm(cfg, system_prompt, user_prompt):
-    """流式输出 API 响应，返回完整文本"""
-    resp = _api_request(cfg, system_prompt, user_prompt, stream=True)
-
-    buffer = ""
+def _iter_stream_chunks(resp):
+    """从 SSE 流中逐块提取 content 文本"""
     for raw_line in resp:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line.startswith("data: "):
@@ -614,14 +639,50 @@ def stream_llm(cfg, system_prompt, user_prompt):
             delta = chunk["choices"][0].get("delta", {})
             content = delta.get("content", "")
             if content:
-                print(content, end="", flush=True)
-                buffer += content
+                yield content
         except (json.JSONDecodeError, KeyError, IndexError):
             continue
+
+
+def stream_llm(cfg, system_prompt, user_prompt):
+    """流式纯文本输出，返回完整文本"""
+    resp = _api_request(cfg, system_prompt, user_prompt, stream=True)
+
+    buffer = ""
+    for content in _iter_stream_chunks(resp):
+        print(content, end="", flush=True)
+        buffer += content
 
     print()
     resp.close()
     log(f"流式响应完成: {len(buffer)} 字符")
+    llm_log(system_prompt, user_prompt, buffer)
+    return buffer
+
+
+def stream_llm_rich(cfg, system_prompt, user_prompt):
+    """流式 Markdown 渲染输出，使用 rich Live 实时刷新"""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.live import Live
+    except ImportError:
+        print(f"{C.YELLOW}提示: 安装 rich 库以获得流式 Markdown 渲染:{C.RESET}")
+        print("  pip install rich")
+        print(f"{C.DIM}回退到纯文本流式输出...{C.RESET}\n")
+        return stream_llm(cfg, system_prompt, user_prompt)
+
+    resp = _api_request(cfg, system_prompt, user_prompt, stream=True)
+    console = Console()
+    buffer = ""
+
+    with Live(Markdown(""), console=console, refresh_per_second=8, vertical_overflow="visible") as live:
+        for content in _iter_stream_chunks(resp):
+            buffer += content
+            live.update(Markdown(buffer))
+
+    resp.close()
+    log(f"流式 Markdown 响应完成: {len(buffer)} 字符")
     llm_log(system_prompt, user_prompt, buffer)
     return buffer
 
@@ -738,11 +799,12 @@ def parse_args(argv=None):
         prog="what",
         description="分析终端命令的执行结果（自动捕获上一条命令）",
         epilog="""示例:
-  what                              分析上一条命令（默认 Markdown 非流式）
+  what                              分析上一条命令（默认流式 Markdown 渲染）
   what -q "这个错误怎么修"            带自定义问题（推荐）
   what --show                       查看捕获到的原始信息
   what --smart                      启用智能缩减后再发送给 LLM
-  what --stream                     流式纯文本输出
+  what --stream                     流式纯文本输出（无 Markdown 渲染）
+  what --plain                      非流式纯文本输出
   what --cmd 'ls -la /' --output-file /tmp/out.txt --exit-code 0  手动测试""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -754,8 +816,8 @@ def parse_args(argv=None):
     parser.add_argument("--smart", action="store_true", help="启用智能缩减，只发送提炼后的关键输出")
     parser.add_argument("--raw", action="store_true", help="兼容旧参数：当前默认就是发送完整输出")
     parser.add_argument("--md", action="store_true", help="兼容旧参数：当前默认就是 Markdown 渲染")
-    parser.add_argument("--plain", action="store_true", help="纯文本输出，禁用 Markdown 渲染")
-    parser.add_argument("--stream", action="store_true", help="流式纯文本输出")
+    parser.add_argument("--plain", action="store_true", help="非流式纯文本输出")
+    parser.add_argument("--stream", action="store_true", help="流式纯文本输出（无 Markdown 渲染）")
     parser.add_argument("-d", "--debug", action="store_true", help="调试模式：日志同步输出到 stderr")
     # 测试模式（无需安装 hook）
     parser.add_argument("--cmd", help="手动指定命令文本（测试用，无需 hook）")
@@ -844,12 +906,11 @@ def main():
     # ── 调用 LLM ──
     if args.stream:
         stream_llm(cfg, system_prompt, user_prompt)
-    else:
+    elif args.plain:
         text = call_llm_nonstream(cfg, system_prompt, user_prompt)
-        if args.plain:
-            print(text)
-        else:
-            render_markdown(text)
+        print(text)
+    else:
+        stream_llm_rich(cfg, system_prompt, user_prompt)
     print()
 
     log("完成")

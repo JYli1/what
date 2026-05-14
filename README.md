@@ -14,13 +14,14 @@
 已经实现：
 
 - 自动捕获上一条命令、退出码和输出。
-- 默认 Markdown 渲染，报错分析更容易读。
+- 默认流式 Markdown 渲染（`rich` Live 实时刷新），打字机效果。
 - 兼容常见 LLM API，可接 DeepSeek、Ollama 等服务。
 - 内置 `default` / `pentest` / `dev` / `ops` / `custom` 工作方向。
 - 支持 `--smart` 本地智能缩减长输出，节省 token。
 - 支持 `--show` 只查看捕获内容，不调用 API。
 - 完整日志与 LLM 对话原文记录，方便排查和复盘。
 - 支持 zsh / bash hook，安装后自然融入终端工作流。
+- Windows PowerShell 原生支持（基于 History + 重执行捕获）。
 
 ```bash
 $ npm run build
@@ -30,6 +31,19 @@ error: Cannot find module 'xxx'
 $ what
 # 直接告诉你错误原因、修复命令和下一步检查点
 ```
+
+## 更新日志
+
+### v0.3 — 流式 Markdown 渲染 + Windows 钩子重构
+
+- **默认输出改为流式 Markdown 渲染**：使用 `rich` Live 实时刷新，打字机效果，不再等待完整响应后一次性渲染。
+- **Windows 输出捕获重构**：移除 Transcript 录制方案，改为通过 PowerShell History + 重执行命令捕获输出，更稳定可靠。
+- **Windows 钩子精简**：不再依赖 PSReadLine Enter 键拦截和 Transcript，改用 prompt 函数 + Get-History，兼容性更好。
+- **BOM 兼容**：`read_file` 使用 `utf-8-sig` 编码，解决 Windows 下 PowerShell 写入文件带 BOM 导致解析失败的问题。
+- **Prompt 优化**：回答要求调整为"第一行立即给结论"，减少冗余前缀。
+- `--stream` 现在明确表示"流式纯文本（无渲染）"，`--plain` 表示"非流式纯文本"。
+
+---
 
 ## 安装
 
@@ -81,7 +95,7 @@ $ rustscan -a 10.216.75.108 --json  (exit: 1)
 
 | 参数 | 作用 | 例子 |
 |------|------|------|
-| `what` | 分析上一条命令，默认非流式 + Markdown 渲染 | `what` |
+| `what` | 分析上一条命令，默认流式 Markdown 渲染 | `what` |
 | `-q`, `--question "问题"` | 带自定义追问，用引号包裹 | `what -q "怎么修复 Permission denied"` |
 
 ### 输出控制
@@ -89,8 +103,8 @@ $ rustscan -a 10.216.75.108 --json  (exit: 1)
 | 参数 | 作用 | 例子 |
 |------|------|------|
 | `--smart` | 启用智能缩减，只发送提炼后的关键输出 | `what --smart` |
-| `--stream` | 流式纯文本输出，不等待完整响应 | `what --stream` |
-| `--plain` | 非流式纯文本输出，禁用 Markdown 渲染 | `what --plain` |
+| `--stream` | 流式纯文本输出（无 Markdown 渲染） | `what --stream` |
+| `--plain` | 非流式纯文本输出 | `what --plain` |
 | `--raw` | 兼容旧参数：当前默认就是发送完整输出 | `what --raw` |
 | `--md` | 兼容旧参数：当前默认就是 Markdown 渲染 | `what --md` |
 | `--show` | 只查看捕获的原始命令+输出，不调 LLM | `what --show` |
@@ -240,12 +254,14 @@ cat ~/.what/what.log       # 查看完整日志
 ~/.what/
 ├── venv/           # Python 虚拟环境
 ├── what            # Python 主程序
-├── what-hook.sh    # Shell 钩子
+├── what-hook.sh    # Shell 钩子 (Linux)
 ├── config          # 配置文件
 ├── what.log        # 操作日志
 ├── llm.log         # LLM 对话原文
 ├── hook.log        # 钩子日志
-└── session.log     # 终端录制
+├── session.log     # 终端录制 (Linux)
+├── last_cmd        # 上一条命令文本
+└── last_exit       # 上一条命令退出码
 
 ~/.local/bin/
 └── what            # Shell wrapper → 调用 venv 中的 Python

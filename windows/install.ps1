@@ -118,7 +118,7 @@ if (Test-Path $VENV_DIR) {
 Write-Host ""
 Write-Host "--- Python dependencies (may take a while) ---"
 $pip = "$VENV_DIR\Scripts\pip.exe"
-& $pip install rich
+& $pip install rich 2>&1 | Out-Null
 Write-Host "[OK] rich installed to virtual env (Markdown rendering)"
 
 # Install main script to ~/.what/

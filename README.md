@@ -48,7 +48,7 @@ $ what
 ## 安装
 
 ```bash
-git clone https://github.com/your/what.git
+git clone https://github.com/JYli1/what.git
 cd what
 ./install.sh
 ```

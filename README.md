@@ -74,6 +74,26 @@ what --setup          # 配置 API Key
 . $PROFILE            # 重新加载配置（或重启 PowerShell）
 ```
 
+## 更新
+
+### Linux
+
+```bash
+cd what
+git pull
+./install.sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+cd what\windows
+git pull
+.\install.ps1
+```
+
+更新后无需重新配置，`~/.what/config` 会保留。
+
 ## 使用
 
 ```bash
